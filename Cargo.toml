@@ -1,0 +1,7 @@
+[workspace]
+members = [
+    "protos",
+    "ms-executor",
+    "ms-worker"
+]
+resolver = "2"

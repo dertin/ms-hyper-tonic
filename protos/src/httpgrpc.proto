@@ -1,0 +1,28 @@
+syntax = "proto3";
+
+package httpgrpc;
+
+service HTTP {
+  rpc Handle(HTTPRequest) returns (HTTPResponse) {};
+}
+
+message HTTPRequest {
+  string id = 1;
+  string version = 2;
+  string method = 3;
+  string uri = 4;
+  repeated Header headers = 5;
+  bytes body = 6;
+}
+
+message HTTPResponse {
+  string version = 1;
+  int32 status = 2;
+  repeated Header headers = 3;
+  bytes body = 4;
+}
+
+message Header {
+  string key = 1;
+  repeated string values = 2;
+}
