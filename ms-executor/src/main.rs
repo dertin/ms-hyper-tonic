@@ -1,24 +1,25 @@
-use tokio::runtime::{Builder, Runtime};
 use uuid::Uuid;
 
-// HTTP/1 server - Hyper.rs
-use http_body_util::Full;
-use hyper::body::Bytes;
-use hyper::server::conn::http1;
-use hyper::{body::Incoming as IncomingBody, Request, Response};
-use std::net::SocketAddr;
-use tokio::net::TcpListener;
 
-// gRPC protos - Tonic
+// HTTP/1 server - Hyper.rs
+use std::convert::Infallible;
+use std::net::SocketAddr;
+use hyper::{Body, Request, Response, Server};
+use hyper::service::{make_service_fn, service_fn};
+
+// gRPC protos
 use protos::httpgrpc::http_client::HttpClient;
 use protos::httpgrpc::{Header, HttpRequest, HttpResponse};
+
+// BlockingClient - Tonic
+use std::sync::mpsc::channel;
 
 type StdError = Box<dyn std::error::Error + Send + Sync + 'static>;
 type Result<T, E = StdError> = ::std::result::Result<T, E>;
 
 struct BlockingClient {
     client: HttpClient<tonic::transport::Channel>,
-    rt: Runtime,
+    rt: tokio::runtime::Runtime,
 }
 
 impl BlockingClient {
@@ -27,7 +28,7 @@ impl BlockingClient {
         D: TryInto<tonic::transport::Endpoint>,
         D::Error: Into<StdError>,
     {
-        let rt = Builder::new_multi_thread().enable_all().build().unwrap();
+        let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
         let client = rt.block_on(HttpClient::connect(dst))?;
 
         Ok(Self { client, rt })
@@ -41,90 +42,93 @@ impl BlockingClient {
     }
 }
 
-#[derive(Debug, Clone)]
-struct Svc {
-    grpc_client: i32,
-}
 
-async fn util_body_to_vec(req: Request<IncomingBody>) -> Vec<u8> {
-    http_body_util::BodyExt::collect(req)
-        .await
-        .unwrap()
-        .to_bytes()
-        .into()
-}
-// Implementacion del servicio HTTP para atender las peticiones entrantes
-impl hyper::service::Service<Request<IncomingBody>> for Svc {
-    type Response = Response<Full<Bytes>>;
-    type Error = hyper::Error;
-    type Future = std::pin::Pin<
-        Box<dyn std::future::Future<Output = Result<Self::Response, Self::Error>> + Send>,
-    >;
+async fn handle_request(req: Request<Body>) -> Result<Response<Body>, Infallible> {
 
-    fn call(&mut self, incoming_request: Request<IncomingBody>) -> Self::Future {
-        //let rt  = Runtime::new().unwrap();
+    println!(
+        "received request! method: {:?}, url: {:?}, headers: {:?}, body: {:?}",
+        req.method(),
+        req.uri(),
+        req.headers(),
+        req.body()
+    );
 
-        println!(
-            "received request! method: {:?}, url: {:?}, headers: {:?}",
-            incoming_request.method(),
-            incoming_request.uri(),
-            incoming_request.headers()
-        );
+    let uuid_request = Uuid::new_v4().to_string();
+    let str_method = req.method().to_string();
+    let str_uri = req.uri().to_string();
+    let str_version = format!("{:?}", req.version());
+    let vec_headers = Header { // TODO
+        key: "".to_owned(),
+        values: vec!["".to_owned()],
+    };
+    let full_body = hyper::body::to_bytes(req.into_body()).await.unwrap();
 
-        let uuid_request = Uuid::new_v4().to_string();
-        let str_method = incoming_request.method().to_string();
-        let str_uri = incoming_request.uri().to_string();
-        let str_version = format!("{:?}", incoming_request.version());
-        let vec_headers = Header {
-            key: "".to_owned(),
-            values: vec!["".to_owned()],
-        };
+    let grpc_request = tonic::Request::new(HttpRequest {
+        id: uuid_request,
+        version: str_version,
+        method: str_method,
+        uri: str_uri,
+        body: full_body.to_vec(),
+        headers: vec![vec_headers],
+    });
 
-        // Await the whole body to be collected into a single `Bytes`...
-        //let str_body = rt.block_on(util_body_to_vec(incoming_request));
+    // Send message to grpc server
 
-        // make gRPC request - http incoming request to grpc outgoing request
-        let grpc_request = tonic::Request::new(HttpRequest {
-            id: uuid_request,
-            version: str_version,
-            method: str_method,
-            uri: str_uri,
-            body: vec![1],
-            headers: vec![vec_headers],
-        });
+    let endpoints = ["http://[::1]:50051"]
+        .iter()
+        .map(|a| tonic::transport::Channel::from_static(a));
+    let channel_tonic = tonic::transport::Channel::balance_list(endpoints);
+    let mut client = HttpClient::new(channel_tonic);
+    // FIXME: ConnectError("tcp connect error", Os { code: 10048, kind: AddrInUse, message: ...
+    // The connection is already in use.
+    let response = client.handle(grpc_request).await.unwrap();
+    println!("RESPONSE={:?}", response); // TODO: convert to http response
 
-        std::thread::spawn(|| {
-            println!("Sending request to gRPC Server...");
-            let mut grpc_client = BlockingClient::connect("http://[::1]:50051").unwrap();
-            let grpc_response = grpc_client.handle(grpc_request).unwrap();
-            println!("RESPONSE={:?}", grpc_response);
-        })
-        .join()
-        .expect("Thread panicked");
+    /*
+    
+    // Try blocking but I get the same error.
 
-        Box::pin(async { Ok(Response::new(Full::new(Bytes::from("Hello, World!")))) })
-    }
+    let (tx, rx) = channel();
+
+    std::thread::spawn(move || {
+
+        println!("Sending request to gRPC Server...");
+        println!("{:?}", grpc_request);
+
+        // FIXME: ConnectError("tcp connect error", Os { code: 10048, kind: AddrInUse, message: ...
+        // The connection is already in use.
+        let mut grpc_client = BlockingClient::connect("http://[::1]:50051").unwrap();
+
+        let grpc_response = grpc_client.handle(grpc_request).unwrap();
+        
+        tx.send(grpc_response).unwrap();
+
+    })
+    .join()
+    .expect("Thread panicked");
+
+    println!("RESPONSE={:?}", rx.recv().unwrap()); // TODO: convert to http response
+    */
+
+    Ok(Response::new("Hello, World".into()))
 }
 
 #[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // Listener HTTP Server - Hyper.rs
-    let addr = SocketAddr::from(([0, 0, 0, 0], 8000));
-    let listener = TcpListener::bind(addr).await?;
+async fn main() {
+    // We'll bind to 127.0.0.1:3000
+    let addr = SocketAddr::from(([0, 0, 0, 0], 3000));
 
-    // We start a loop to continuously accept incoming connections
+    // A `Service` is needed for every connection, so this
+    // creates one from our `hello_world` function.
+    let make_svc = make_service_fn(|_conn| async {
+        // service_fn converts our function into a `Service`
+        Ok::<_, Infallible>(service_fn(handle_request))
+    });
 
-    loop {
-        let (stream, _) = listener.accept().await?;
+    let server = Server::bind(&addr).serve(make_svc);
 
-        // Spawn a tokio task to serve multiple connections concurrently
-        tokio::task::spawn(async move {
-            if let Err(err) = http1::Builder::new()
-                .serve_connection(stream, Svc { grpc_client: 0 })
-                .await
-            {
-                println!("Error serving connection: {:?}", err);
-            }
-        });
+    // Run this server for... forever!
+    if let Err(e) = server.await {
+        eprintln!("server error: {}", e);
     }
 }
