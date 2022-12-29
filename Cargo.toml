@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "protos",
+    "ms-executor-axum",
     "ms-executor",
     "ms-worker"
 ]
