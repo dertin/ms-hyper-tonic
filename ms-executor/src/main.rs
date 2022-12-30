@@ -1,7 +1,7 @@
 use uuid::Uuid;
 
 // HTTP/1 server - Hyper.rs
-use hyper::http::Version;
+use hyper::http::{HeaderValue, Version};
 use hyper::service::Service;
 use hyper::{Body, Request, Response, Server};
 use std::future::Future;
@@ -21,47 +21,73 @@ async fn shutdown_signal() {
 }
 
 async fn handle_request(
-    req: Request<Body>,
+    http_request: Request<Body>,
     mut grpc_client: HttpClient<tonic::transport::Channel>,
 ) -> Result<Response<Body>, hyper::Error> {
-
-    let uuid = Uuid::new_v4().to_string();
-    let str_method = req.method().to_string();
-    let str_uri = req.uri().to_string();
-    let str_version = match req.version() {
+    // Create grpc request from http request
+    let http_uuid = Uuid::new_v4().to_string();
+    let http_method = http_request.method().to_string();
+    let http_uri = http_request.uri().to_string();
+    let http_version = match http_request.version() {
         Version::HTTP_09 => "HTTP/0.9",
         Version::HTTP_10 => "HTTP/1.0",
         Version::HTTP_11 => "HTTP/1.1",
         Version::HTTP_2 => "HTTP/2.0",
         Version::HTTP_3 => "HTTP/3.0",
-        _ => "",
+        _ => "HTTP/1.1",
     };
-    let mut vec_headers = Vec::new();
-    for header in req.headers(){
-        vec_headers.push(Header {
+    let mut http_headers = Vec::new();
+    for header in http_request.headers() {
+        http_headers.push(Header {
             key: header.0.to_string(),
             values: vec![header.1.to_str().unwrap_or_default().to_string()],
         })
     }
-    let vec_body = hyper::body::to_bytes(req.into_body()).await.unwrap().to_vec();
+    let http_body: Vec<u8> = hyper::body::to_bytes(http_request.into_body())
+        .await
+        .unwrap()
+        .to_vec();
 
-    let grpc_request = tonic::Request::new(HttpRequest {
-        id: uuid,
-        version: str_version.to_string(),
-        method: str_method,
-        uri: str_uri,
-        body: vec_body,
-        headers: vec_headers,
+    let grpc_request: tonic::Request<HttpRequest> = tonic::Request::new(HttpRequest {
+        id: http_uuid,
+        version: http_version.to_string(),
+        method: http_method,
+        uri: http_uri,
+        body: http_body,
+        headers: http_headers,
     });
 
-    // Send message to grpc server
-    let grpc_response: tonic::Response<HttpResponse> = grpc_client.handle(grpc_request).await.unwrap();
+    // Send request to grpc server
+    let grpc_response: tonic::Response<HttpResponse> =
+        grpc_client.handle(grpc_request).await.unwrap();
 
-    //TODO:
-    let res = Response::builder()
-        .status(hyper::StatusCode::OK)
-        .body(Body::empty())
+    let grpc_response_ref = grpc_response.get_ref().to_owned();
+
+    // Generate http response from grpc response
+    let res_status = grpc_response_ref.status.try_into().unwrap_or(500);
+    let res_version = match grpc_response_ref.version.as_str() {
+        "HTTP_09" => Version::HTTP_09,
+        "HTTP_10" => Version::HTTP_10,
+        "HTTP_11" => Version::HTTP_11,
+        "HTTP_2" => Version::HTTP_2,
+        "HTTP_3" => Version::HTTP_3,
+        _ => Version::HTTP_11,
+    };
+
+    let res_body = Body::from(grpc_response_ref.body);
+    let mut res = Response::builder()
+        .version(res_version)
+        .status(res_status)
+        .body(res_body)
         .unwrap();
+
+    let headers_mut = res.headers_mut();
+    let res_headers = grpc_response_ref.headers;
+
+    // TODO:
+    for _header in res_headers {
+        headers_mut.insert("todo", HeaderValue::from_static("123456"));
+    }
 
     Ok(res)
 }
@@ -70,16 +96,16 @@ async fn handle_request(
 async fn main() {
     let addr = SocketAddr::from(([0, 0, 0, 0], 3000));
 
-    let endpoints = ["http://[::1]:50051"]
+    let endpoints = ["http://[::1]:50051", "http://[::1]:50052"]
         .iter()
         .map(|a| tonic::transport::Channel::from_static(a));
     let channel_tonic = tonic::transport::Channel::balance_list(endpoints);
     let grpc_client = HttpClient::new(channel_tonic);
 
     let server = Server::bind(&addr)
-    .http1_preserve_header_case(true)
-    .http1_title_case_headers(true)
-    .serve(MakeSvc { grpc_client });
+        .http1_preserve_header_case(true)
+        .http1_title_case_headers(true)
+        .serve(MakeSvc { grpc_client });
 
     // And now add a graceful shutdown signal...
     let graceful = server.with_graceful_shutdown(shutdown_signal());
