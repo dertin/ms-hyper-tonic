@@ -1,11 +1,13 @@
 use uuid::Uuid;
 
-
 // HTTP/1 server - Hyper.rs
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use hyper::{Body, Request, Response, Server};
-use hyper::service::{make_service_fn, service_fn};
+use hyper::service::{make_service_fn, service_fn, Service};
+use std::future::Future;
+use std::pin::Pin;
+use std::task::{Context, Poll};
 
 // gRPC protos
 use protos::httpgrpc::http_client::HttpClient;
@@ -43,7 +45,7 @@ impl BlockingClient {
 }
 
 
-async fn handle_request(req: Request<Body>) -> Result<Response<Body>, Infallible> {
+async fn handle_request(req: Request<Body>, mut grpc_client: HttpClient<tonic::transport::Channel>) -> Result<Response<Body>, hyper::Error> {
 
     println!(
         "received request! method: {:?}, url: {:?}, headers: {:?}, body: {:?}",
@@ -74,14 +76,10 @@ async fn handle_request(req: Request<Body>) -> Result<Response<Body>, Infallible
 
     // Send message to grpc server
 
-    let endpoints = ["http://[::1]:50051"]
-        .iter()
-        .map(|a| tonic::transport::Channel::from_static(a));
-    let channel_tonic = tonic::transport::Channel::balance_list(endpoints);
-    let mut client = HttpClient::new(channel_tonic);
+    
     // FIXME: ConnectError("tcp connect error", Os { code: 10048, kind: AddrInUse, message: ...
     // The connection is already in use.
-    let response = client.handle(grpc_request).await.unwrap();
+    let response = grpc_client.handle(grpc_request).await.unwrap();
     println!("RESPONSE={:?}", response); // TODO: convert to http response
 
     /*
@@ -118,17 +116,65 @@ async fn main() {
     // We'll bind to 127.0.0.1:3000
     let addr = SocketAddr::from(([0, 0, 0, 0], 3000));
 
+    let endpoints = ["http://[::1]:50051"]
+        .iter()
+        .map(|a| tonic::transport::Channel::from_static(a));
+    let channel_tonic = tonic::transport::Channel::balance_list(endpoints);
+    let grpc_client = HttpClient::new(channel_tonic);
+    
     // A `Service` is needed for every connection, so this
     // creates one from our `hello_world` function.
-    let make_svc = make_service_fn(|_conn| async {
+    /*let make_svc = make_service_fn(|_conn| async {
         // service_fn converts our function into a `Service`
         Ok::<_, Infallible>(service_fn(handle_request))
-    });
+    });*/
 
-    let server = Server::bind(&addr).serve(make_svc);
+    let server = Server::bind(&addr).serve(MakeSvc { grpc_client });
 
     // Run this server for... forever!
     if let Err(e) = server.await {
         eprintln!("server error: {}", e);
+    }
+}
+
+
+struct Svc {
+    grpc_client: HttpClient<tonic::transport::Channel>,
+}
+
+impl Service<Request<Body>> for Svc {
+    type Response = Response<Body>;
+    type Error = hyper::Error;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+    fn poll_ready(&mut self, _: &mut Context) -> Poll<Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, req: Request<Body>) -> Self::Future {
+        //println!("{:?}", self.grpc_client);
+        Box::pin( { 
+            handle_request(req, self.grpc_client.clone())
+        })
+    }
+}
+
+struct MakeSvc {
+    grpc_client: HttpClient<tonic::transport::Channel>,
+}
+
+impl<T> Service<T> for MakeSvc {
+    type Response = Svc;
+    type Error = hyper::Error;
+    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
+
+    fn poll_ready(&mut self, _: &mut Context) -> Poll<Result<(), Self::Error>> {
+        Poll::Ready(Ok(()))
+    }
+
+    fn call(&mut self, _: T) -> Self::Future {
+        let mut grpc_client = self.grpc_client.clone();
+        let fut = async move { Ok(Svc { grpc_client }) };
+        Box::pin(fut)
     }
 }
