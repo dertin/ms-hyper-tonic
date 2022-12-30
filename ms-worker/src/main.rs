@@ -3,16 +3,17 @@ use tokio::sync::mpsc;
 use tonic::{transport::Server, Request, Response, Status};
 
 use protos::httpgrpc::{Header, HttpRequest, HttpResponse};
+use protos::httpgrpc::http_server::{Http, HttpServer};
 
 type HttpResult<T> = Result<Response<T>, Status>;
 
 #[derive(Debug)]
-pub struct HttpServer {
+pub struct GrpcServer {
     addr: SocketAddr,
 }
 
 #[tonic::async_trait]
-impl protos::httpgrpc::http_server::Http for HttpServer {
+impl Http for GrpcServer {
     async fn handle(&self, request: Request<HttpRequest>) -> HttpResult<HttpResponse> {
         
         println!("request [{}] from [{}]", request.into_inner().id, self.addr);
@@ -40,9 +41,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let addr = addr.parse()?;
         let tx = tx.clone();
 
-        let server = HttpServer { addr };
+        let server = GrpcServer { addr };
         let serve = Server::builder()
-            .add_service(protos::httpgrpc::http_server::HttpServer::new(server))
+            .add_service(HttpServer::new(server))
             .serve(addr);
 
         tokio::spawn(async move {

@@ -2,7 +2,7 @@ use self::multiplex_service::MultiplexService;
 use axum::{routing::get, Router};
 
 use protos::httpgrpc::http_server::{Http, HttpServer};
-use protos::httpgrpc::{Header, HttpRequest, HttpResponse};
+use protos::httpgrpc::{HttpRequest, HttpResponse};
 
 use std::net::SocketAddr;
 use tonic::{Response as TonicResponse, Status};

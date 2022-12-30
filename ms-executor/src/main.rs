@@ -1,119 +1,73 @@
 use uuid::Uuid;
 
 // HTTP/1 server - Hyper.rs
-use std::convert::Infallible;
-use std::net::SocketAddr;
+use hyper::http::Version;
+use hyper::service::Service;
 use hyper::{Body, Request, Response, Server};
-use hyper::service::{make_service_fn, service_fn, Service};
 use std::future::Future;
+use std::net::SocketAddr;
 use std::pin::Pin;
 use std::task::{Context, Poll};
 
-// gRPC protos
+// httpgrpc - protos
 use protos::httpgrpc::http_client::HttpClient;
 use protos::httpgrpc::{Header, HttpRequest, HttpResponse};
 
-// BlockingClient - Tonic
-use std::sync::mpsc::channel;
-
-type StdError = Box<dyn std::error::Error + Send + Sync + 'static>;
-type Result<T, E = StdError> = ::std::result::Result<T, E>;
-
-struct BlockingClient {
-    client: HttpClient<tonic::transport::Channel>,
-    rt: tokio::runtime::Runtime,
+async fn shutdown_signal() {
+    // Wait for the CTRL+C signal
+    tokio::signal::ctrl_c()
+        .await
+        .expect("failed to install CTRL+C signal handler");
 }
 
-impl BlockingClient {
-    pub fn connect<D>(dst: D) -> Result<Self, tonic::transport::Error>
-    where
-        D: TryInto<tonic::transport::Endpoint>,
-        D::Error: Into<StdError>,
-    {
-        let rt = tokio::runtime::Builder::new_multi_thread().enable_all().build().unwrap();
-        let client = rt.block_on(HttpClient::connect(dst))?;
+async fn handle_request(
+    req: Request<Body>,
+    mut grpc_client: HttpClient<tonic::transport::Channel>,
+) -> Result<Response<Body>, hyper::Error> {
 
-        Ok(Self { client, rt })
-    }
-
-    pub fn handle(
-        &mut self,
-        request: impl tonic::IntoRequest<HttpRequest>,
-    ) -> Result<tonic::Response<HttpResponse>, tonic::Status> {
-        self.rt.block_on(self.client.handle(request))
-    }
-}
-
-
-async fn handle_request(req: Request<Body>, mut grpc_client: HttpClient<tonic::transport::Channel>) -> Result<Response<Body>, hyper::Error> {
-
-    println!(
-        "received request! method: {:?}, url: {:?}, headers: {:?}, body: {:?}",
-        req.method(),
-        req.uri(),
-        req.headers(),
-        req.body()
-    );
-
-    let uuid_request = Uuid::new_v4().to_string();
+    let uuid = Uuid::new_v4().to_string();
     let str_method = req.method().to_string();
     let str_uri = req.uri().to_string();
-    let str_version = format!("{:?}", req.version());
-    let vec_headers = Header { // TODO
-        key: "".to_owned(),
-        values: vec!["".to_owned()],
+    let str_version = match req.version() {
+        Version::HTTP_09 => "HTTP/0.9",
+        Version::HTTP_10 => "HTTP/1.0",
+        Version::HTTP_11 => "HTTP/1.1",
+        Version::HTTP_2 => "HTTP/2.0",
+        Version::HTTP_3 => "HTTP/3.0",
+        _ => "",
     };
-    let full_body = hyper::body::to_bytes(req.into_body()).await.unwrap();
+    let mut vec_headers = Vec::new();
+    for header in req.headers(){
+        vec_headers.push(Header {
+            key: header.0.to_string(),
+            values: vec![header.1.to_str().unwrap_or_default().to_string()],
+        })
+    }
+    let vec_body = hyper::body::to_bytes(req.into_body()).await.unwrap().to_vec();
 
     let grpc_request = tonic::Request::new(HttpRequest {
-        id: uuid_request,
-        version: str_version,
+        id: uuid,
+        version: str_version.to_string(),
         method: str_method,
         uri: str_uri,
-        body: full_body.to_vec(),
-        headers: vec![vec_headers],
+        body: vec_body,
+        headers: vec_headers,
     });
 
     // Send message to grpc server
+    let grpc_response: tonic::Response<HttpResponse> = grpc_client.handle(grpc_request).await.unwrap();
 
-    
-    // FIXME: ConnectError("tcp connect error", Os { code: 10048, kind: AddrInUse, message: ...
-    // The connection is already in use.
-    let response = grpc_client.handle(grpc_request).await.unwrap();
-    println!("RESPONSE={:?}", response); // TODO: convert to http response
+    //TODO:
+    let res = Response::builder()
+        .status(hyper::StatusCode::OK)
+        .body(Body::empty())
+        .unwrap();
 
-    /*
-    
-    // Try blocking but I get the same error.
-
-    let (tx, rx) = channel();
-
-    std::thread::spawn(move || {
-
-        println!("Sending request to gRPC Server...");
-        println!("{:?}", grpc_request);
-
-        // FIXME: ConnectError("tcp connect error", Os { code: 10048, kind: AddrInUse, message: ...
-        // The connection is already in use.
-        let mut grpc_client = BlockingClient::connect("http://[::1]:50051").unwrap();
-
-        let grpc_response = grpc_client.handle(grpc_request).unwrap();
-        
-        tx.send(grpc_response).unwrap();
-
-    })
-    .join()
-    .expect("Thread panicked");
-
-    println!("RESPONSE={:?}", rx.recv().unwrap()); // TODO: convert to http response
-    */
-
-    Ok(Response::new("Hello, World".into()))
+    Ok(res)
 }
 
 #[tokio::main]
 async fn main() {
-    // We'll bind to 127.0.0.1:3000
     let addr = SocketAddr::from(([0, 0, 0, 0], 3000));
 
     let endpoints = ["http://[::1]:50051"]
@@ -121,22 +75,20 @@ async fn main() {
         .map(|a| tonic::transport::Channel::from_static(a));
     let channel_tonic = tonic::transport::Channel::balance_list(endpoints);
     let grpc_client = HttpClient::new(channel_tonic);
-    
-    // A `Service` is needed for every connection, so this
-    // creates one from our `hello_world` function.
-    /*let make_svc = make_service_fn(|_conn| async {
-        // service_fn converts our function into a `Service`
-        Ok::<_, Infallible>(service_fn(handle_request))
-    });*/
 
-    let server = Server::bind(&addr).serve(MakeSvc { grpc_client });
+    let server = Server::bind(&addr)
+    .http1_preserve_header_case(true)
+    .http1_title_case_headers(true)
+    .serve(MakeSvc { grpc_client });
+
+    // And now add a graceful shutdown signal...
+    let graceful = server.with_graceful_shutdown(shutdown_signal());
 
     // Run this server for... forever!
-    if let Err(e) = server.await {
+    if let Err(e) = graceful.await {
         eprintln!("server error: {}", e);
     }
 }
-
 
 struct Svc {
     grpc_client: HttpClient<tonic::transport::Channel>,
@@ -152,9 +104,9 @@ impl Service<Request<Body>> for Svc {
     }
 
     fn call(&mut self, req: Request<Body>) -> Self::Future {
-        //println!("{:?}", self.grpc_client);
-        Box::pin( { 
-            handle_request(req, self.grpc_client.clone())
+        Box::pin({
+            let grpc_client_clone = self.grpc_client.clone();
+            handle_request(req, grpc_client_clone)
         })
     }
 }
@@ -173,8 +125,12 @@ impl<T> Service<T> for MakeSvc {
     }
 
     fn call(&mut self, _: T) -> Self::Future {
-        let mut grpc_client = self.grpc_client.clone();
-        let fut = async move { Ok(Svc { grpc_client }) };
+        let grpc_client_clone = self.grpc_client.clone();
+        let fut = async move {
+            Ok(Svc {
+                grpc_client: grpc_client_clone,
+            })
+        };
         Box::pin(fut)
     }
 }
