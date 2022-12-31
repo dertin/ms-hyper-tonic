@@ -82,11 +82,17 @@ async fn handle_request(
         .unwrap();
 
     let headers_mut = res.headers_mut();
-    let res_headers = grpc_response_ref.headers;
+    let res_headers = grpc_response_ref.headers.clone();
 
-    // TODO:
-    for _header in res_headers {
-        headers_mut.insert("todo", HeaderValue::from_static("123456"));
+    // TODO: It should be improved how the headers are inserted in response. Avoid using Box::Leak
+    for header in res_headers {
+        let string_key = header.key.to_owned();
+        let str_key: &str = Box::leak(string_key.into_boxed_str());
+
+        for string_values in header.values {
+            let str_values: &str = Box::leak(string_values.into_boxed_str());
+            headers_mut.insert(str_key, HeaderValue::from_static(str_values));
+        }
     }
 
     Ok(res)

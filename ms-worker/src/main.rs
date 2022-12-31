@@ -19,14 +19,18 @@ impl Http for GrpcServer {
         println!("request [{}] from [{}]", request.into_inner().id, self.addr);
 
         let vec_headers = Header {
-            key: "test".to_owned(),
+            key: "test1".to_owned(),
+            values: vec!["1234".to_owned()],
+        };
+        let vec_headers_2 = Header {
+            key: "test2".to_owned(),
             values: vec!["1234".to_owned()],
         };
 
         Ok(Response::new(HttpResponse { 
             version: "1.1".to_string(), 
             status: 200, 
-            headers: vec![vec_headers], 
+            headers: vec![vec_headers, vec_headers_2], 
             body: "Pong".as_bytes().to_vec() }))
     }
 }
