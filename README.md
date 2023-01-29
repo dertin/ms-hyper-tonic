@@ -10,6 +10,7 @@ Stress test to analyze memory leak or memory fragmentation in Hyper and Tonic se
 ./run-stress-test.sh
 ```
 
+use valgrind => 3.20.0
 ```
 ./killall.sh
 ./valgrind-executor.sh
