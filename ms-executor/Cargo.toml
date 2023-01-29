@@ -3,10 +3,13 @@ name = "ms-executor"
 version = "0.1.0"
 edition = "2021"
 
+[target.'cfg(not(target_env = "msvc"))'.dependencies]
+tikv-jemallocator = {version = "0.5", features = ["background_threads"] }
+
 [dependencies]
 uuid = {version = "1.2.2", features = ["v4"]}
 futures = "0.3"
 protos = { path = "../protos"}
 hyper = { version = "0.14", features = ["full"] }
-tokio = { version = "1", features = ["full"] }
+tokio = { version = "1.24.2", features = ["full"] }
 tonic = "0.8.3"

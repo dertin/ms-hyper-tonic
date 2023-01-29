@@ -2,8 +2,17 @@ Proof of concept using Hyper.rs as http server and Tonic gRPC for communication 
 
 ![alt request flow](request-flow.drawio.svg?raw=true "request flow")
 
+
+Stress test to analyze memory leak or memory fragmentation in Hyper and Tonic services:
+
 ```
-cargo build
-cargo run --bin ms-worker
-cargo run --bin ms-executor
+./start-services.sh
+./run-stress-test.sh
+```
+
+```
+./killall.sh
+./valgrind-executor.sh
+./valgrind-worker.sh
+
 ```

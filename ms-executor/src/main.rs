@@ -1,6 +1,13 @@
+#[cfg(not(target_env = "msvc"))]
+use tikv_jemallocator::Jemalloc;
+
+#[cfg(not(target_env = "msvc"))]
+#[global_allocator]
+static GLOBAL: Jemalloc = Jemalloc;
+
 use uuid::Uuid;
 
-// HTTP/1 server - Hyper.rs
+// HTTP server - Hyper.rs
 use hyper::http::{HeaderValue, Version};
 use hyper::service::Service;
 use hyper::{Body, Request, Response, Server};
@@ -102,7 +109,7 @@ async fn handle_request(
 async fn main() {
     let addr = SocketAddr::from(([0, 0, 0, 0], 3000));
 
-    let endpoints = ["http://[::1]:50051", "http://[::1]:50052"]
+    let endpoints = ["http://[::1]:50051"]
         .iter()
         .map(|a| tonic::transport::Channel::from_static(a));
     let channel_tonic = tonic::transport::Channel::balance_list(endpoints);
