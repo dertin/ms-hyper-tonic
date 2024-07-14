@@ -3,11 +3,9 @@ name = "ms-worker"
 version = "0.1.0"
 edition = "2021"
 
-[target.'cfg(not(target_env = "msvc"))'.dependencies]
-tikv-jemallocator = {version = "0.5", features = ["background_threads"] }
-
 [dependencies]
+mimalloc = { version = "*", default-features = false }
 protos = { path = "../protos"}
-tokio = { version = "1.24.2", features = ["full"] }
-tonic = "0.8.3"
+tokio = { version = "1.38.0", features = ["full"] }
+tonic = "0.12.0"
 

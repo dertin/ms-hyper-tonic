@@ -1,36 +1,31 @@
-#[cfg(not(target_env = "msvc"))]
-use tikv_jemallocator::Jemalloc;
+use hyper_util::rt::TokioTimer;
+use mimalloc::MiMalloc;
 
-#[cfg(not(target_env = "msvc"))]
 #[global_allocator]
-static GLOBAL: Jemalloc = Jemalloc;
+static GLOBAL: MiMalloc = MiMalloc;
 
+use std::future::Future;
+use std::net::SocketAddr;
+use std::pin::{pin, Pin};
+use std::time::Duration;
 use uuid::Uuid;
 
 // HTTP server - Hyper.rs
-use hyper::http::{HeaderValue, Version};
+use http_body_util::BodyExt;
+use http_body_util::Full;
+use hyper::body::{Bytes, Incoming};
+use hyper::http::Version;
 use hyper::service::Service;
-use hyper::{Body, Request, Response, Server};
-use std::future::Future;
-use std::net::SocketAddr;
-use std::pin::Pin;
-use std::task::{Context, Poll};
+use hyper::{Request, Response};
 
 // httpgrpc - protos
 use protos::httpgrpc::http_client::HttpClient;
 use protos::httpgrpc::{Header, HttpRequest, HttpResponse};
 
-async fn shutdown_signal() {
-    // Wait for the CTRL+C signal
-    tokio::signal::ctrl_c()
-        .await
-        .expect("failed to install CTRL+C signal handler");
-}
-
 async fn handle_request(
-    http_request: Request<Body>,
+    http_request: Request<Incoming>,
     mut grpc_client: HttpClient<tonic::transport::Channel>,
-) -> Result<Response<Body>, hyper::Error> {
+) -> Result<Response<Full<Bytes>>, hyper::Error> {
     // Create grpc request from http request
     let http_uuid = Uuid::new_v4().to_string();
     let http_method = http_request.method().to_string();
@@ -50,9 +45,12 @@ async fn handle_request(
             values: vec![header.1.to_str().unwrap_or_default().to_string()],
         })
     }
-    let http_body: Vec<u8> = hyper::body::to_bytes(http_request.into_body())
-        .await
-        .unwrap()
+
+    let http_body: Vec<u8> = http_request
+        .into_body()
+        .collect()
+        .await?
+        .to_bytes()
         .to_vec();
 
     let grpc_request: tonic::Request<HttpRequest> = tonic::Request::new(HttpRequest {
@@ -81,7 +79,7 @@ async fn handle_request(
         _ => Version::HTTP_11,
     };
 
-    let res_body = Body::from(grpc_response_ref.body);
+    let res_body = http_body_util::Full::from(grpc_response_ref.body);
     let mut res = Response::builder()
         .version(res_version)
         .status(res_status)
@@ -93,9 +91,10 @@ async fn handle_request(
 
     for header in res_headers {
         let string_key = header.key.to_owned();
-        if let Ok(str_key) = <hyper::header::HeaderName as std::str::FromStr>::from_str(&string_key) {
+        if let Ok(str_key) = <hyper::header::HeaderName as std::str::FromStr>::from_str(&string_key)
+        {
             for string_values in header.values {
-                if let Ok(str_value) = hyper::header::HeaderValue::from_str(&string_values){
+                if let Ok(str_value) = hyper::header::HeaderValue::from_str(&string_values) {
                     headers_mut.insert(&str_key, str_value);
                 }
             }
@@ -115,61 +114,88 @@ async fn main() {
     let channel_tonic = tonic::transport::Channel::balance_list(endpoints);
     let grpc_client = HttpClient::new(channel_tonic);
 
-    let server = Server::bind(&addr)
-        .http1_preserve_header_case(true)
-        .http1_title_case_headers(true)
-        .serve(MakeSvc { grpc_client });
+    let listener = tokio::net::TcpListener::bind(addr).await.unwrap();
+    println!("Listening on {}", addr);
 
-    // And now add a graceful shutdown signal...
-    let graceful = server.with_graceful_shutdown(shutdown_signal());
+    let svc = Svc { grpc_client };
 
-    // Run this server for... forever!
-    if let Err(e) = graceful.await {
-        eprintln!("server error: {}", e);
+    let mut server =
+        hyper_util::server::conn::auto::Builder::new(hyper_util::rt::TokioExecutor::new());
+
+    server
+        .http1()
+        .preserve_header_case(true)
+        .title_case_headers(true)
+        .max_headers(100)
+        .timer(TokioTimer::new())
+        .header_read_timeout(Duration::from_secs(30))
+        .keep_alive(true)
+        .header_read_timeout(Duration::from_secs(30));
+
+    server.http2().max_concurrent_streams(200);
+
+    let graceful = hyper_util::server::graceful::GracefulShutdown::new();
+    let mut ctrl_c = pin!(tokio::signal::ctrl_c());
+
+    loop {
+        tokio::select! {
+            conn = listener.accept() => {
+                let (stream, peer_addr) = match conn {
+                    Ok(conn) => conn,
+                    Err(e) => {
+                        eprintln!("accept error: {}", e);
+                        tokio::time::sleep(Duration::from_secs(1)).await;
+                        continue;
+                    }
+                };
+                println!("incomming connection accepted: {}", peer_addr);
+
+                let stream = hyper_util::rt::TokioIo::new(Box::pin(stream));
+                let svc_clone = svc.clone();
+                let conn = server.serve_connection(stream, svc_clone);
+
+                let conn = graceful.watch(conn.into_owned());
+
+                tokio::spawn(async move {
+                    if let Err(err) = conn.await {
+                        eprintln!("connection error: {}", err);
+                    }
+                    println!("connection dropped: {}", peer_addr);
+                });
+            },
+            _ = ctrl_c.as_mut() => {
+                drop(listener);
+                println!("Ctrl-C received, starting shutdown");
+                break;
+            }
+        }
+    }
+
+    tokio::select! {
+        _ = graceful.shutdown() => {
+            println!("Gracefully shutdown!");
+        },
+        _ = tokio::time::sleep(Duration::from_secs(10)) => {
+            eprintln!("Waited 10 seconds for graceful shutdown, aborting...");
+        }
     }
 }
 
+#[derive(Debug, Clone)]
 struct Svc {
     grpc_client: HttpClient<tonic::transport::Channel>,
 }
 
-impl Service<Request<Body>> for Svc {
-    type Response = Response<Body>;
+impl Service<Request<Incoming>> for Svc {
+    type Response = Response<http_body_util::Full<Bytes>>;
     type Error = hyper::Error;
     type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
 
-    fn poll_ready(&mut self, _: &mut Context) -> Poll<Result<(), Self::Error>> {
-        Poll::Ready(Ok(()))
-    }
-
-    fn call(&mut self, req: Request<Body>) -> Self::Future {
-        Box::pin({
-            let grpc_client_clone = self.grpc_client.clone();
-            handle_request(req, grpc_client_clone)
-        })
-    }
-}
-
-struct MakeSvc {
-    grpc_client: HttpClient<tonic::transport::Channel>,
-}
-
-impl<T> Service<T> for MakeSvc {
-    type Response = Svc;
-    type Error = hyper::Error;
-    type Future = Pin<Box<dyn Future<Output = Result<Self::Response, Self::Error>> + Send>>;
-
-    fn poll_ready(&mut self, _: &mut Context) -> Poll<Result<(), Self::Error>> {
-        Poll::Ready(Ok(()))
-    }
-
-    fn call(&mut self, _: T) -> Self::Future {
+    fn call(&self, req: Request<Incoming>) -> Self::Future {
         let grpc_client_clone = self.grpc_client.clone();
-        let fut = async move {
-            Ok(Svc {
-                grpc_client: grpc_client_clone,
-            })
-        };
-        Box::pin(fut)
+        Box::pin(async move {
+            let result = handle_request(req, grpc_client_clone).await;
+            result
+        })
     }
 }
